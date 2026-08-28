@@ -230,8 +230,12 @@ impl Lit {
     /// Keep this in sync with `Token::can_begin_literal_maybe_minus` and
     /// `Parser::eat_token_lit` (excluding unary negation).
     pub fn from_token(token: &Token) -> Option<Lit> {
-        match token.uninterpolate().kind {
+        // We avoid using `Token::uninterpolate` here because it's slow.
+        match token.kind {
             Ident(name, IdentIsRaw::No) if name.is_bool_lit() => Some(Lit::new(Bool, name, None)),
+            NtIdent(ident, IdentIsRaw::No) if ident.name.is_bool_lit() => {
+                Some(Lit::new(Bool, ident.name, None))
+            }
             Literal(token_lit) => Some(token_lit),
             OpenInvisible(InvisibleOrigin::MetaVar(
                 MetaVarKind::Literal | MetaVarKind::Expr { .. },
@@ -815,7 +819,11 @@ impl Token {
     }
 
     pub fn can_begin_string_literal(&self) -> bool {
-        match self.uninterpolate().kind {
+        // We avoid using `Token::uninterpolate` here because it's slow, and
+        // here it cannot affect the result anyway: it only rewrites `NtIdent`
+        // and `NtLifetime` into `Ident` and `Lifetime`, and neither of those
+        // matches any arm below.
+        match self.kind {
             Literal(..) => true,
             OpenInvisible(InvisibleOrigin::MetaVar(mv_kind)) => match mv_kind {
                 MetaVarKind::Literal => true,
