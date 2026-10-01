@@ -26,4 +26,7 @@ pub mod locator;
 
 pub use fs::{METADATA_FILENAME, emit_wrapper_file};
 pub use host_dylib::{DylibError, load_symbol_from_dylib};
-pub use rmeta::{EncodedMetadata, METADATA_HEADER, ProcMacroKind, encode_metadata, rendered_const};
+pub use rmeta::{
+    EncodedMetadata, METADATA_HEADER, ProcMacroKind, encode_early_metadata, encode_metadata,
+    rendered_const,
+};

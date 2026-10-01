@@ -1,0 +1,43 @@
+error[E0308]: mismatched types
+  --> $DIR/early-metadata-interface-body-errors.rs:14:17
+   |
+LL |     let x: u8 = 1u16;
+   |            --   ^^^^ expected `u8`, found `u16`
+   |            |
+   |            expected due to this
+   |
+help: change the type of the numeric literal from `u16` to `u8`
+   |
+LL -     let x: u8 = 1u16;
+LL +     let x: u8 = 1u8;
+   |
+
+error[E0505]: cannot move out of `s` because it is borrowed
+  --> $DIR/early-metadata-interface-body-errors.rs:21:10
+   |
+LL |     let s = String::new();
+   |         - binding `s` declared here
+LL |     let r = &s;
+   |             -- borrow of `s` occurs here
+LL |     drop(s);
+   |          ^ move out of `s` occurs here
+LL |     r.len()
+   |     - borrow later used here
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+LL |     let r = &s.clone();
+   |               ++++++++
+
+error[E0308]: mismatched types
+  --> $DIR/early-metadata-interface-body-errors.rs:10:5
+   |
+LL | pub const fn wrong() -> u32 {
+   |                         --- expected `u32` because of return type
+LL |     "not a number"
+   |     ^^^^^^^^^^^^^^ expected `u32`, found `&str`
+
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0308, E0505.
+For more information about an error, try `rustc --explain E0308`.

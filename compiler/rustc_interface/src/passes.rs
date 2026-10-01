@@ -28,6 +28,7 @@ use rustc_incremental::setup_dep_graph;
 use rustc_lint::{BufferedEarlyLint, EarlyCheckNode, LintStore, unerased_lint_store};
 use rustc_metadata::EncodedMetadata;
 use rustc_metadata::creader::CStore;
+use rustc_metadata::fs::EarlyMetadataFiles;
 use rustc_middle::arena::Arena;
 use rustc_middle::middle::resolve::{ResolverAstLowering, ResolverGlobalCtxt};
 use rustc_middle::ty::{self, RegisteredTools, TyCtxt};
@@ -1292,11 +1293,112 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) {
     }
 }
 
+/// Early metadata written by [`write_early_metadata`], kept until the
+/// compilation ends: linking writes the rlib after the global context is gone.
+///
+/// Dependents started on the early metadata wait for the crate's full
+/// metadata and rlib by waiting for locks held until each is written (see
+/// [`rustc_metadata::fs::OutputLock`]). If the compilation fails (reports
+/// errors, or panics), the locks are released without them, which tells
+/// those dependents to stop; the early metadata itself is deleted too.
+#[must_use]
+pub struct EarlyMetadata<'a> {
+    sess: &'a Session,
+    files: Option<EarlyMetadataFiles>,
+}
+
+impl<'a> EarlyMetadata<'a> {
+    /// Guards `files` for the rest of `sess`'s compilation.
+    pub fn new(sess: &'a Session, files: Option<EarlyMetadataFiles>) -> Self {
+        EarlyMetadata { sess, files }
+    }
+
+    /// Stops guarding the early metadata, and returns its files, to be
+    /// guarded again with [`EarlyMetadata::new`].
+    pub fn into_files(mut self) -> Option<EarlyMetadataFiles> {
+        self.files.take()
+    }
+
+    fn full_metadata_written(&mut self) {
+        if let Some(files) = &mut self.files {
+            files.full_metadata_written();
+        }
+    }
+}
+
+impl Drop for EarlyMetadata<'_> {
+    fn drop(&mut self) {
+        let Some(mut files) = self.files.take() else { return };
+        if std::thread::panicking() || self.sess.dcx().has_errors().is_some() {
+            let _ = std::fs::remove_file(&files.path);
+        }
+        files.rlib_written();
+    }
+}
+
+/// `-Zearly-metadata`: once the crate's item interfaces are checked, and
+/// before its function bodies are, write early metadata (and announce it with
+/// `--json=artifacts`) so a build tool can start dependent crates. Whatever
+/// the interface needs from a body (an opaque type's hidden type, a const's
+/// value) is computed on demand. Full metadata is written as usual later. If a
+/// body fails to check, compilation still fails, and the early metadata is
+/// withdrawn; see [`EarlyMetadata`].
+pub fn write_early_metadata(tcx: TyCtxt<'_>) -> EarlyMetadata<'_> {
+    let none = EarlyMetadata { sess: tcx.sess, files: None };
+    // Crates nothing can depend on (binaries) write no early metadata.
+    if !tcx.sess.opts.unstable_opts.early_metadata
+        || !tcx.sess.opts.output_types.contains_key(&OutputType::Metadata)
+        || !tcx.needs_metadata()
+    {
+        return none;
+    }
+    tcx.ensure_ok().analysis_interfaces(());
+    if tcx.sess.dcx().has_errors_or_delayed_bugs().is_some() {
+        return none;
+    }
+    // Encoding freezes the definitions table, so first create the
+    // definitions that checking bodies adds. Statics' nested allocations
+    // come from evaluating them, in parallel under `-Zthreads`, as in
+    // `check_crate_bodies`.
+    tcx.par_hir_body_owners(|def_id| {
+        if let rustc_hir::def::DefKind::Static { .. } = tcx.def_kind(def_id) {
+            tcx.ensure_ok().eval_static_initializer(def_id);
+        }
+    });
+    // Async closures' by-move bodies are new `DefId`s, so they're created
+    // in a sequential pass, in a deterministic order, as in
+    // `check_crate_bodies`; and only once the item they're in is
+    // type-checked, since `needs_coroutine_by_move_body_def_id` asks for the
+    // closure's type. Checking the item also feeds the type of any const
+    // argument the closure is nested in.
+    for def_id in tcx.hir_body_owners() {
+        if let Some(rustc_hir::CoroutineKind::Desugared(_, rustc_hir::CoroutineSource::Closure)) =
+            tcx.coroutine_kind(def_id.to_def_id())
+        {
+            let item = tcx.hir_get_parent_item(tcx.local_def_id_to_hir_id(def_id)).def_id;
+            if tcx.hir_maybe_body_owned_by(item).is_some() {
+                tcx.ensure_ok().typeck(item);
+            }
+            if tcx.needs_coroutine_by_move_body_def_id(def_id.to_def_id()) {
+                tcx.ensure_done().coroutine_by_move_body_def_id(def_id);
+            }
+        }
+    }
+    if tcx.sess.dcx().has_errors_or_delayed_bugs().is_some() {
+        return none;
+    }
+    EarlyMetadata {
+        sess: tcx.sess,
+        files: rustc_metadata::fs::encode_and_write_early_metadata(tcx),
+    }
+}
+
 /// Runs the codegen backend, after which the AST and analysis can
 /// be discarded.
 pub(crate) fn start_codegen<'tcx>(
     codegen_backend: &dyn CodegenBackend,
     tcx: TyCtxt<'tcx>,
+    early_metadata: &mut EarlyMetadata<'_>,
 ) -> (Box<dyn Any>, CrateInfo, EncodedMetadata) {
     tcx.sess.timings.start_section(tcx.sess.dcx(), TimingSection::Codegen);
 
@@ -1326,6 +1428,7 @@ pub(crate) fn start_codegen<'tcx>(
         Ok(metadata) => metadata,
         Err(guar) => guar.raise_fatal(),
     };
+    early_metadata.full_metadata_written();
 
     let is_host_metadata = tcx
         .sess

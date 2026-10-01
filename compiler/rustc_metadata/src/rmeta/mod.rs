@@ -6,7 +6,7 @@ use decoder::LazyDecoder;
 pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob, TargetModifiers};
 use def_path_hash_map::DefPathHashMapRef;
 use encoder::EncodeContext;
-pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
+pub use encoder::{EncodedMetadata, encode_early_metadata, encode_metadata, rendered_const};
 pub(crate) use parameterized::ParameterizedOverTcx;
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;

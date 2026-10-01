@@ -2513,6 +2513,9 @@ options! {
     eagerly_emit_delayed_bugs: bool = (false, parse_bool, [UNTRACKED],
         "emit delayed bugs eagerly as errors instead of stashing them and emitting \
         them only if an error has not been emitted"),
+    early_metadata: bool = (false, parse_bool, [TRACKED],
+        "write crate metadata as soon as item interfaces are checked, before function \
+        bodies are, so dependent crates can start sooner (default: no)"),
     ehcont_guard: bool = (false, parse_bool, [TRACKED],
         "generate Windows EHCont Guard tables"),
     embed_metadata: bool = (true, parse_bool, [TRACKED],

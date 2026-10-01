@@ -1372,7 +1372,19 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn iter_local_def_id(self) -> impl Iterator<Item = LocalDefId> {
         // Depend on the `analysis` query to ensure compilation if finished.
         self.ensure_ok().analysis(());
+        self.iter_local_def_id_unchecked()
+    }
 
+    /// Like [`Self::iter_local_def_id`], but only requires the crate's item
+    /// interfaces to be checked (`analysis_interfaces`). For `-Zearly-metadata`,
+    /// which encodes metadata before function bodies are checked. The caller
+    /// must first create any definitions that checking bodies would add.
+    pub fn iter_local_def_id_after_interfaces(self) -> impl Iterator<Item = LocalDefId> {
+        self.ensure_ok().analysis_interfaces(());
+        self.iter_local_def_id_unchecked()
+    }
+
+    fn iter_local_def_id_unchecked(self) -> impl Iterator<Item = LocalDefId> {
         let definitions = &self.untracked.definitions;
         gen {
             let mut i = 0;
@@ -1388,6 +1400,13 @@ impl<'tcx> TyCtxt<'tcx> {
             // Freeze definitions once we finish iterating on them, to prevent adding new ones.
             definitions.freeze();
         }
+    }
+
+    /// Like [`Self::definitions`], but only requires the crate's item
+    /// interfaces to be checked; see [`Self::iter_local_def_id_after_interfaces`].
+    pub fn definitions_after_interfaces(self) -> &'tcx rustc_hir::definitions::Definitions {
+        self.ensure_ok().analysis_interfaces(());
+        self.untracked.definitions.freeze()
     }
 
     pub fn definitions(self) -> &'tcx rustc_hir::definitions::Definitions {

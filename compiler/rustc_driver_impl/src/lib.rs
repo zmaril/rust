@@ -312,6 +312,8 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
                 return None;
             }
 
+            let mut early_metadata = passes::write_early_metadata(tcx);
+
             tcx.ensure_ok().analysis(());
 
             if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
@@ -324,7 +326,8 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
                 }
             }
 
-            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+            let linker =
+                Linker::codegen_and_build_linker(tcx, codegen_backend, &mut early_metadata);
 
             if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
                 dump_feature_usage_metrics(tcx, metrics_dir);
@@ -332,12 +335,15 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
 
             tcx.report_unused_features();
 
-            Some(linker)
+            Some((linker, early_metadata.into_files()))
         });
 
         // Linking is done outside the `compiler.enter()` so that the
         // `GlobalCtxt` within `Queries` can be freed as early as possible.
-        if let (Some(linker), incr_comp_session) = linker {
+        if let (Some((linker, early_metadata)), incr_comp_session) = linker {
+            // Linking finishes code generation and writes the rlib, which
+            // dependents started on the early metadata may be waiting for.
+            let _early_metadata = passes::EarlyMetadata::new(sess, early_metadata);
             linker.link(sess, incr_comp_session, codegen_backend);
         }
     })

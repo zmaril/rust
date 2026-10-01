@@ -29,8 +29,10 @@ impl Linker {
     pub fn codegen_and_build_linker(
         tcx: TyCtxt<'_>,
         codegen_backend: &dyn CodegenBackend,
+        early_metadata: &mut passes::EarlyMetadata<'_>,
     ) -> Linker {
-        let (ongoing_codegen, crate_info, metadata) = passes::start_codegen(codegen_backend, tcx);
+        let (ongoing_codegen, crate_info, metadata) =
+            passes::start_codegen(codegen_backend, tcx, early_metadata);
 
         Linker {
             dep_graph: tcx.dep_graph.clone(),
