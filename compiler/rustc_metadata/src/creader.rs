@@ -1,7 +1,8 @@
 //! Validates all used crates and extern libraries and loads their metadata
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{cmp, env, iter};
 
@@ -235,11 +236,22 @@ impl CStore {
     }
 
     pub(crate) fn get_crate_data(&self, cnum: CrateNum) -> &CrateMetadata {
-        self.metas[cnum].as_ref().unwrap_or_else(|| panic!("Failed to get crate data for {cnum:?}"))
+        let data = self.metas[cnum]
+            .as_ref()
+            .unwrap_or_else(|| panic!("Failed to get crate data for {cnum:?}"));
+        // A crate loaded from early metadata is decoded from its full metadata
+        // once that's loaded.
+        data.full().unwrap_or(data)
     }
 
     pub(crate) fn get_crate_data_mut(&mut self, cnum: CrateNum) -> &mut CrateMetadata {
-        self.metas[cnum].as_mut().unwrap_or_else(|| panic!("Failed to get crate data for {cnum:?}"))
+        let data = self.metas[cnum]
+            .as_mut()
+            .unwrap_or_else(|| panic!("Failed to get crate data for {cnum:?}"));
+        // Readers get the full metadata once it's loaded; changes to the early
+        // metadata would be lost on them.
+        assert!(data.full().is_none(), "crate data changed after its full metadata was loaded");
+        data
     }
 
     fn set_crate_data(&mut self, cnum: CrateNum, data: CrateMetadata) {
@@ -265,9 +277,61 @@ impl CStore {
     }
 
     pub(crate) fn iter_crate_data(&self) -> impl Iterator<Item = (CrateNum, &CrateMetadata)> {
-        self.metas
+        self.metas.iter_enumerated().filter_map(|(cnum, data)| {
+            data.as_deref().map(|data| (cnum, data.full().unwrap_or(data)))
+        })
+    }
+
+    /// `-Zearly-metadata`: loads the full metadata of every dependency loaded
+    /// from early metadata. Code generation needs it: the MIR of generic and
+    /// inline functions, exported symbols. Full metadata that isn't written
+    /// yet is waited for (see [`wait_for_full_metadata`]).
+    pub fn load_full_metadata(tcx: TyCtxt<'_>) {
+        let cstore = CStore::from_tcx(tcx);
+        let early: Vec<CrateNum> = cstore
+            .metas
             .iter_enumerated()
             .filter_map(|(cnum, data)| data.as_deref().map(|data| (cnum, data)))
+            .filter(|(_, data)| data.is_early() && data.full().is_none())
+            .map(|(cnum, _)| cnum)
+            .collect();
+        let mut pause = Pause::default();
+        for cnum in early {
+            let data = cstore.metas[cnum].as_deref().unwrap();
+            let early_path = data.source().rmeta.clone().unwrap();
+            let (blob, full_path) = wait_for_full_metadata(
+                tcx,
+                &*cstore.metadata_loader,
+                &early_path,
+                data.hash(),
+                &mut pause,
+            );
+            data.set_full(tcx, blob, full_path);
+        }
+        pause.resume(tcx.sess);
+    }
+
+    /// `-Zearly-metadata`: waits until the rlibs this crate links against
+    /// exist. A crate that links can start on its dependencies' metadata; the
+    /// locator then records where each dependency's rlib will be, and the
+    /// rlib is written (atomically) when that dependency finishes. Fails if a
+    /// dependency finishes without writing it: it failed to compile.
+    pub fn wait_for_rlibs<'a>(sess: &Session, sources: impl IntoIterator<Item = &'a CrateSource>) {
+        let mut pause = Pause::default();
+        for source in sources {
+            let Some(rlib) = &source.rlib else { continue };
+            if rlib.exists() {
+                continue;
+            }
+            wait_for_output(sess, rlib, &mut pause);
+            if !rlib.exists() {
+                sess.dcx().fatal(format!(
+                    "a dependency failed to compile, or its rlib `{}` is missing",
+                    rlib.display()
+                ));
+            }
+        }
+        pause.resume(sess);
     }
 
     pub fn all_proc_macro_def_ids(&self, tcx: TyCtxt<'_>) -> impl Iterator<Item = DefId> {
@@ -1434,4 +1498,91 @@ fn fn_spans(krate: &ast::Crate, name: Symbol) -> Vec<Span> {
     let mut f = Finder { name, spans: Vec::new() };
     visit::walk_crate(&mut f, krate);
     f.spans
+}
+
+/// While this compilation waits for dependencies' full metadata or rlibs, it
+/// tells the build tool, announcing each file it waits for in turn (a
+/// `wait-metadata` artifact notification) and when it continues (`resume`).
+/// The build tool can give its job slot to other work meanwhile. It resumes
+/// as soon as the file is written, without taking a jobserver token, so it
+/// can't be starved by work started in its place: the build tool counts it
+/// as running again and starts nothing new until enough jobs finish. This
+/// never touches the jobserver, so a build tool that doesn't read these
+/// notifications sees a compilation that ran as usual, if longer.
+#[derive(Default)]
+struct Pause {
+    paused: bool,
+    /// The file announced last: a paused compilation can wait for several
+    /// files in turn, and announces each, so the build tool knows when it's
+    /// really ready to resume.
+    waiting_for: Option<PathBuf>,
+}
+
+impl Pause {
+    fn pause(&mut self, sess: &Session, waiting_for: &Path) {
+        if self.waiting_for.as_deref() == Some(waiting_for) {
+            return;
+        }
+        self.paused = true;
+        self.waiting_for = Some(waiting_for.to_path_buf());
+        if sess.opts.json_artifact_notifications {
+            sess.dcx().emit_artifact_notification(waiting_for, "wait-metadata");
+        }
+    }
+
+    fn resume(&mut self, sess: &Session) {
+        if !self.paused {
+            return;
+        }
+        self.paused = false;
+        self.waiting_for = None;
+        if sess.opts.json_artifact_notifications {
+            sess.dcx().emit_artifact_notification(Path::new(""), "resume");
+        }
+    }
+}
+
+/// Waits while the compilation that writes `output` holds its lock (see
+/// `fs::OutputLock`): until it has written `output`, or has failed or crashed
+/// without writing it. Returns at once if no compilation holds the lock.
+fn wait_for_output(sess: &Session, output: &Path, pause: &mut Pause) {
+    let Ok(lock) = File::open(crate::fs::output_lock_path(output)) else { return };
+    if lock.try_lock_shared().is_ok() {
+        return;
+    }
+    pause.pause(sess, output);
+    // An error here means the lock can't be waited for; the caller then
+    // checks for the output, as if the lock had been released.
+    let _ = lock.lock_shared();
+}
+
+/// Waits until the full metadata of the crate whose early metadata is at
+/// `early_path` is written, and loads it. Fails if that crate finishes
+/// without writing it, or writes it with another crate hash: it failed to
+/// compile.
+fn wait_for_full_metadata(
+    tcx: TyCtxt<'_>,
+    metadata_loader: &dyn MetadataLoader,
+    early_path: &Path,
+    hash: Svh,
+    pause: &mut Pause,
+) -> (MetadataBlob, PathBuf) {
+    let full_path = crate::locator::full_metadata_path(early_path);
+    if !full_path.exists() {
+        wait_for_output(tcx.sess, &full_path, pause);
+    }
+    match crate::locator::get_metadata_section(
+        &tcx.sess.target,
+        crate::locator::CrateFlavor::Rmeta,
+        &full_path,
+        metadata_loader,
+        tcx.sess.cfg_version,
+        None,
+    ) {
+        Ok(blob) if blob.get_crate_hash() == hash => (blob, full_path),
+        _ => tcx.dcx().fatal(format!(
+            "a dependency failed to compile after writing early metadata `{}`",
+            early_path.display()
+        )),
+    }
 }

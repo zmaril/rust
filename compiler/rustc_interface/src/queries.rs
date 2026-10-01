@@ -166,6 +166,17 @@ impl Linker {
             return;
         }
 
+        // `-Zearly-metadata`: dependencies' rlibs may still be being written.
+        if sess.opts.unstable_opts.early_metadata && sess.opts.output_types.should_link() {
+            rustc_metadata::creader::CStore::wait_for_rlibs(
+                sess,
+                self.crate_info
+                    .used_crates
+                    .iter()
+                    .map(|cnum| &*self.crate_info.used_crate_source[cnum]),
+            );
+        }
+
         let _timer = sess.prof.verbose_generic_activity("link_crate");
         let _timing = sess.timings.section_guard(sess.dcx(), TimingSection::Linking);
         codegen_backend.link(

@@ -1424,6 +1424,23 @@ pub(crate) fn start_codegen<'tcx>(
 
     info!("Pre-codegen\n{:?}", tcx.debug_stats());
 
+    // `-Zearly-metadata`: code generation needs the full metadata of
+    // dependencies that were loaded from early metadata.
+    if tcx.sess.opts.unstable_opts.early_metadata && tcx.sess.opts.output_types.should_codegen() {
+        CStore::load_full_metadata(tcx);
+        // Cross-crate LTO reads dependencies' rlibs during code generation,
+        // not just when linking.
+        if matches!(
+            tcx.sess.lto(),
+            rustc_session::config::Lto::Fat | rustc_session::config::Lto::Thin
+        ) {
+            CStore::wait_for_rlibs(
+                tcx.sess,
+                tcx.crates(()).iter().map(|&cnum| &**tcx.used_crate_source(cnum)),
+            );
+        }
+    }
+
     let metadata = match rustc_metadata::fs::encode_and_write_metadata(tcx) {
         Ok(metadata) => metadata,
         Err(guar) => guar.raise_fatal(),

@@ -149,6 +149,12 @@ pub(crate) struct CrateMetadata {
     /// Information about the `extern crate` item or path that caused this crate to be loaded.
     /// If this is `None`, then the crate was injected (e.g., by the allocator).
     extern_crate: Option<ExternCrate>,
+
+    /// `-Zearly-metadata`: if this crate was loaded from early metadata, its
+    /// full metadata once loaded (see `CStore::load_full_metadata`), which the
+    /// crate store hands out in place of this from then on. This stays alive,
+    /// so anything decoded from it stays valid.
+    full: OnceLock<Box<CrateMetadata>>,
 }
 
 /// Holds information about a rustc_span::SourceFile imported from another crate.
@@ -1997,6 +2003,7 @@ impl CrateMetadata {
             extern_crate: None,
             hygiene_context: Default::default(),
             def_key_cache: Default::default(),
+            full: OnceLock::new(),
         };
 
         cdata.incoherent_impls = cdata
@@ -2009,6 +2016,48 @@ impl CrateMetadata {
             .collect();
 
         cdata
+    }
+
+    /// Whether this crate was loaded from early metadata (`-Zearly-metadata`).
+    pub(crate) fn is_early(&self) -> bool {
+        self.source.rmeta.as_deref().is_some_and(crate::locator::is_early_metadata)
+    }
+
+    /// The full metadata that replaced this early metadata, if loaded.
+    pub(crate) fn full(&self) -> Option<&CrateMetadata> {
+        self.full.get().map(|full| &**full)
+    }
+
+    /// Replaces this early metadata with `blob`, the same crate's full
+    /// metadata at `path`, keeping what this session decided while loading it.
+    pub(crate) fn set_full(&self, tcx: TyCtxt<'_>, blob: MetadataBlob, path: PathBuf) {
+        let root = blob.get_root();
+        let unhashed = blob.get_root_unhashed();
+        let source = CrateSource { rmeta: Some(path), ..(*self.source).clone() };
+        let mut full = CrateMetadata::new(
+            tcx,
+            blob,
+            root,
+            unhashed,
+            self.raw_proc_macros,
+            self.cnum,
+            self.cnum_map.clone(),
+            self.dep_kind,
+            source,
+            self.private_dep,
+            self.host_hash,
+        );
+        full.used = self.used;
+        full.extern_crate = self.extern_crate.clone();
+        // Source files are imported again from the full metadata's table: an
+        // imported file records its index in the table it came from. Spans
+        // decoded before this keep pointing at the early imports, which stay.
+        // Types decoded through a shorthand are cached by their position in
+        // the blob, which means something else in the full metadata.
+        // (Removing entries doesn't depend on the map's iteration order.)
+        #[allow(rustc::potential_query_instability)]
+        tcx.caches.ty_rcache.borrow_mut().retain(|key, _| key.cnum != Some(self.cnum));
+        assert!(self.full.set(Box::new(full)).is_ok(), "full metadata loaded twice");
     }
 
     pub(crate) fn dependencies(&self) -> impl Iterator<Item = CrateNum> {

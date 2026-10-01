@@ -237,6 +237,7 @@ use tracing::{debug, info};
 
 use crate::creader::{Library, MetadataLoader};
 use crate::diagnostics;
+use crate::fs::{EARLY_METADATA_EXTENSION, early_metadata_path};
 use crate::rmeta::{METADATA_HEADER, MetadataBlob, ProcMacroKind, rustc_version};
 
 #[derive(Clone)]
@@ -256,6 +257,10 @@ pub(crate) struct CrateLocator<'a> {
     filesearch: &'a FileSearch,
     is_proc_macro: bool,
     path_kind: PathKind,
+    /// `-Zearly-metadata`: a crate may also be loaded from early metadata
+    /// (`.early-rmeta`), written before its full metadata. See
+    /// [`CrateLocator::choose_metadata`].
+    accept_early_metadata: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +346,7 @@ impl<'a> CrateLocator<'a> {
             filesearch: sess.target_filesearch(),
             path_kind,
             is_proc_macro: false,
+            accept_early_metadata: sess.opts.unstable_opts.early_metadata,
         }
     }
 
@@ -431,12 +437,21 @@ impl<'a> CrateLocator<'a> {
         // option and thus can be anything, and the incorrect match will be
         // handled safely in `extract_one`.
         let mut should_check_staticlibs = true;
+        let early_rmeta_suffix = &format!(".{EARLY_METADATA_EXTENSION}");
+        let early_rmeta = self.accept_early_metadata.then_some((
+            rmeta_prefix.as_str(),
+            early_rmeta_suffix.as_str(),
+            CrateFlavor::Rmeta,
+        ));
         for (prefix, suffix, kind) in [
             (rlib_prefix.as_str(), rlib_suffix, CrateFlavor::Rlib),
             (rmeta_prefix.as_str(), rmeta_suffix, CrateFlavor::Rmeta),
             (dylib_prefix, dylib_suffix, CrateFlavor::Dylib),
             (interface_prefix, interface_suffix, CrateFlavor::SDylib),
-        ] {
+        ]
+        .into_iter()
+        .chain(early_rmeta)
+        {
             if prefix == staticlib_prefix && suffix == staticlib_suffix {
                 should_check_staticlibs = false;
             }
@@ -528,6 +543,23 @@ impl<'a> CrateLocator<'a> {
         interfaces: FxIndexSet<PathBuf>,
     ) -> Result<Option<(Svh, Library)>, CrateError> {
         let mut slot = None;
+        // Of a crate's early and full metadata, prefer the full metadata if
+        // it exists: writing early metadata deletes any older full metadata.
+        let rmetas = if self.accept_early_metadata {
+            let early: Vec<PathBuf> =
+                rmetas.iter().filter(|path| is_early_metadata(path)).cloned().collect();
+            let mut rmetas = rmetas;
+            for early in early {
+                let full = full_metadata_path(&early);
+                if rmetas.contains(&full) {
+                    let chosen = self.choose_metadata(&full, &early);
+                    rmetas.shift_remove(if chosen == full { &early } else { &full });
+                }
+            }
+            rmetas
+        } else {
+            rmetas
+        };
         // Order here matters, rmeta should come first.
         //
         // Make sure there's at most one rlib and at most one dylib.
@@ -543,8 +575,44 @@ impl<'a> CrateLocator<'a> {
             return Err(CrateError::FullMetadataNotFound(self.crate_name, CrateFlavor::SDylib));
         }
 
+        // `-Zearly-metadata`: a crate that links, given a dependency's
+        // metadata, links against its rlib next to it. If the dependency is
+        // still compiling, it holds the rlib's lock, and the crate waits for
+        // the rlib before linking (see `CStore::wait_for_rlibs`); if it's
+        // done, the rlib is there. (The lock is checked first: it's released
+        // after the rlib is written.) Otherwise there's no rlib coming, and
+        // the crate is reported as missing one, as usual.
+        let rlib = match (&rlib, &dylib, &rmeta) {
+            (None, None, Some(rmeta))
+                if self.accept_early_metadata
+                    && !self.only_needs_metadata
+                    && !self.is_proc_macro =>
+            {
+                let full = if is_early_metadata(rmeta) {
+                    full_metadata_path(rmeta)
+                } else {
+                    rmeta.clone()
+                };
+                let pending = full.with_extension("rlib");
+                if crate::fs::output_lock_path(&pending).exists() || pending.exists() {
+                    Some(pending)
+                } else {
+                    None
+                }
+            }
+            _ => rlib,
+        };
+
         let source = CrateSource { rmeta, rlib, dylib, sdylib_interface };
         Ok(slot.map(|(svh, metadata, _, _)| (svh, Library { source, metadata })))
+    }
+
+    /// Of a crate's full and early metadata, the one to load: the full one
+    /// if it exists, otherwise the early one. Writing early metadata deletes
+    /// the crate's old full metadata, so a full file next to early metadata
+    /// is from the same or a later compilation, never an earlier one.
+    fn choose_metadata(&self, full: &Path, early: &Path) -> PathBuf {
+        if full.exists() || !early.exists() { full.to_path_buf() } else { early.to_path_buf() }
     }
 
     fn needs_crate_flavor(&self, flavor: CrateFlavor) -> bool {
@@ -752,6 +820,19 @@ impl<'a> CrateLocator<'a> {
         let mut dylibs = FxIndexSet::default();
         let mut sdylib_interfaces = FxIndexSet::default();
         for loc in &self.exact_paths {
+            // `--extern foo=libfoo.rmeta` also finds `libfoo.early-rmeta`, and
+            // loads the full metadata if it exists.
+            let early_loc;
+            let loc = if self.accept_early_metadata
+                && loc.original().extension().is_some_and(|ext| ext == "rmeta")
+                && self.choose_metadata(loc.original(), &early_metadata_path(loc.original()))
+                    != *loc.original()
+            {
+                early_loc = CanonicalizedPath::new(early_metadata_path(loc.original()));
+                &early_loc
+            } else {
+                loc
+            };
             let loc_canon = loc.canonicalized();
             let loc_orig = loc.original();
             if !loc_canon.exists() {
@@ -774,7 +855,7 @@ impl<'a> CrateLocator<'a> {
                     rlibs.insert(loc_canon.clone());
                     continue;
                 }
-                if file.ends_with(".rmeta") {
+                if file.ends_with(".rmeta") || is_early_metadata(loc_orig) {
                     rmetas.insert(loc_canon.clone());
                     continue;
                 }
@@ -814,7 +895,7 @@ impl<'a> CrateLocator<'a> {
     }
 }
 
-fn get_metadata_section<'p>(
+pub(crate) fn get_metadata_section<'p>(
     target: &Target,
     flavor: CrateFlavor,
     filename: &'p Path,
@@ -973,11 +1054,21 @@ fn get_flavor_from_path(path: &Path) -> CrateFlavor {
 
     if filename.ends_with(".rlib") {
         CrateFlavor::Rlib
-    } else if filename.ends_with(".rmeta") {
+    } else if filename.ends_with(".rmeta") || is_early_metadata(path) {
         CrateFlavor::Rmeta
     } else {
         CrateFlavor::Dylib
     }
+}
+
+/// Whether `path` is early metadata (`-Zearly-metadata`).
+pub(crate) fn is_early_metadata(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == EARLY_METADATA_EXTENSION)
+}
+
+/// The full metadata of the crate whose early metadata is at `early`.
+pub(crate) fn full_metadata_path(early: &Path) -> PathBuf {
+    early.with_extension("rmeta")
 }
 
 /// A function to fetch all macros inside a proc-macro crate.
