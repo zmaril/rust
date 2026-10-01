@@ -56,7 +56,10 @@ fn build_mid_on_early_metadata(opt: &str, finish_dep: impl FnOnce()) -> (bool, S
         .collect();
 
     let mut mid = lib("mid", opt);
-    mid.extern_("dep", "libdep-x.rmeta").error_format("json").json("artifacts");
+    mid.extern_("dep", "libdep-x.rmeta")
+        .arg("-Zearly-metadata-verify")
+        .error_format("json")
+        .json("artifacts");
     let mut mid = mid.into_raw_command();
     mid.stderr(Stdio::piped());
     let mut child = mid.spawn().unwrap();
@@ -110,6 +113,7 @@ fn main() {
         let (built, stderr) = build_mid_on_early_metadata(opt, unhide_dep);
         assert!(built, "build from early metadata failed:\n{stderr}");
         assert!(stderr.contains(r#""emit":"resume""#), "never resumed:\n{stderr}");
+        assert!(!stderr.contains("early-metadata-verify"), "verify reported:\n{stderr}");
         compile("main", opt).extern_("mid", "libmid-x.rlib").output("main").run();
         assert_eq!(run("main").stdout_utf8(), expected);
 

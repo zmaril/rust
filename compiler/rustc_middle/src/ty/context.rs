@@ -1402,6 +1402,13 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
+    /// Whether `typeck(def_id)` has already been computed in this session,
+    /// without computing it. Only for `-Zearly-metadata-verify`'s report.
+    pub fn typeck_is_done(self, def_id: LocalDefId) -> bool {
+        let root = self.typeck_root_def_id_local(def_id);
+        self.query_system.query_vtables.typeck_root.cache.lookup(&root).is_some()
+    }
+
     /// Like [`Self::definitions`], but only requires the crate's item
     /// interfaces to be checked; see [`Self::iter_local_def_id_after_interfaces`].
     pub fn definitions_after_interfaces(self) -> &'tcx rustc_hir::definitions::Definitions {

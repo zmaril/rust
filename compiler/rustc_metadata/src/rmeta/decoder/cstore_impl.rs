@@ -94,6 +94,32 @@ impl ProcessQueryValue<'_, Option<DeprecationEntry>> for Option<Deprecation> {
     }
 }
 
+/// Queries that only full metadata answers; early metadata
+/// (`-Zearly-metadata`) leaves their data out. `is_mir_available` is checked
+/// where it answers no.
+const FULL_METADATA_QUERIES: &[&str] = &[
+    "cross_crate_inlinable",
+    "deduced_param_attrs",
+    "reachable_non_generics",
+    "exported_non_generic_symbols",
+    "exported_generic_symbols",
+    "required_panic_strategy",
+];
+
+/// `-Zearly-metadata-verify`: reports a query that only full metadata can
+/// answer, asked about a crate still loaded from early metadata. The answer
+/// would be wrong, and would stay cached after the full metadata is loaded.
+///
+/// Printed to stderr rather than as a diagnostic, like `-Zprint-*` output:
+/// build tools hide the diagnostics of dependencies, and this concerns
+/// every crate in the build.
+fn verify_not_early(tcx: TyCtxt<'_>, krate: CrateNum, query: &str) {
+    eprintln!(
+        "early-metadata-verify: `{query}` of `{}` answered from early metadata",
+        tcx.crate_name(krate)
+    );
+}
+
 macro_rules! provide_one {
     ($tcx:ident, $def_id:ident, $other:ident, $cdata:ident, $name:ident => { table }) => {
         provide_one! {
@@ -156,6 +182,12 @@ macro_rules! provide_one {
 
             let cstore = CStore::from_tcx($tcx);
             let $cdata = cstore.get_crate_data($def_id.krate);
+            if $tcx.sess.opts.unstable_opts.early_metadata_verify
+                && $cdata.is_early()
+                && FULL_METADATA_QUERIES.contains(&stringify!($name))
+            {
+                verify_not_early($tcx, $def_id.krate, stringify!($name));
+            }
 
             $compute
         }
@@ -329,7 +361,13 @@ provide! { tcx, def_id, other, cdata,
     associated_item => { cdata.get_associated_item(tcx, def_id.index) }
     inherent_impls => { cdata.get_inherent_implementations_for_type(tcx, def_id.index) }
     attrs_for_def => { tcx.arena.alloc_from_iter(cdata.get_item_attrs(tcx, def_id.index)) }
-    is_mir_available => { cdata.is_item_mir_available(def_id.index) }
+    is_mir_available => {
+        let available = cdata.is_item_mir_available(def_id.index);
+        if !available && tcx.sess.opts.unstable_opts.early_metadata_verify && cdata.is_early() {
+            verify_not_early(tcx, def_id.krate, "is_mir_available");
+        }
+        available
+    }
     cross_crate_inlinable => { table_direct }
 
     dylib_dependency_formats => { cdata.get_dylib_dependency_formats(tcx) }

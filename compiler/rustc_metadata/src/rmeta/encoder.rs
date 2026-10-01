@@ -1998,16 +1998,35 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     }
 
     /// Encodes the deferred MIR and definitions nested in interface bodies.
+    /// With `-Zearly-metadata-verify`, reports any left out whose body was
+    /// type-checked anyway: a body `interface_bodies` should have included.
     fn encode_deferred(&mut self) {
+        let verify = self.tcx.sess.opts.unstable_opts.early_metadata_verify;
         for (def_id, body, c, o) in std::mem::take(&mut self.deferred_mir) {
             if self.interface_bodies().contains(&body) {
                 self.encode_mir_for(def_id, c, o);
+            } else if verify {
+                self.report_missed_body(def_id, body);
             }
         }
         for (def_id, body) in std::mem::take(&mut self.deferred_defs) {
             if self.interface_bodies().contains(&body) {
                 self.encode_info_for_def(def_id);
+            } else if verify {
+                self.report_missed_body(def_id, body);
             }
+        }
+    }
+
+    /// Printed to stderr like `verify_not_early`'s reports, for the same reason.
+    fn report_missed_body(&self, def_id: LocalDefId, body: LocalDefId) {
+        if self.tcx.typeck_is_done(body) {
+            eprintln!(
+                "early-metadata-verify: left out `{}`, but `{}` was type-checked \
+                 during the early write",
+                self.tcx.def_path_debug_str(def_id.to_def_id()),
+                self.tcx.def_path_debug_str(body.to_def_id()),
+            );
         }
     }
 

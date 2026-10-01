@@ -2516,6 +2516,10 @@ options! {
     early_metadata: bool = (false, parse_bool, [TRACKED],
         "write crate metadata as soon as item interfaces are checked, before function \
         bodies are, so dependent crates can start sooner (default: no)"),
+    early_metadata_verify: bool = (false, parse_bool, [UNTRACKED],
+        "with `-Zearly-metadata`, report bodies type-checked during the early write whose \
+        nested definitions were left out of it, and queries only full metadata can answer \
+        asked of crates loaded from early metadata (default: no)"),
     ehcont_guard: bool = (false, parse_bool, [TRACKED],
         "generate Windows EHCont Guard tables"),
     embed_metadata: bool = (true, parse_bool, [TRACKED],
