@@ -891,6 +891,7 @@ pub fn write_interface<'tcx>(tcx: TyCtxt<'tcx>) {
 
 pub static DEFAULT_QUERY_PROVIDERS: LazyLock<Providers> = LazyLock::new(|| {
     let providers = &mut Providers::default();
+    providers.queries.analysis_interfaces = analysis_interfaces;
     providers.queries.analysis = analysis;
     providers.queries.resolver_for_lowering_raw = resolver_for_lowering_raw;
     providers.queries.stripped_cfg_items = |tcx, _| &tcx.resolutions(()).stripped_cfg_items[..];
@@ -1087,9 +1088,9 @@ pub fn emit_delayed_lints(tcx: TyCtxt<'_>) {
     }
 }
 
-/// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
-/// This function never fails.
-fn run_required_analyses(tcx: TyCtxt<'_>) {
+/// Runs the required analyses up to and including the item interface checks,
+/// before any function body is type-checked. See the `analysis_interfaces` query.
+fn analysis_interfaces(tcx: TyCtxt<'_>, (): ()) {
     if tcx.sess.opts.unstable_opts.input_stats {
         rustc_passes::input_stats::print_hir_stats(tcx);
     }
@@ -1144,7 +1145,16 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
         emit_delayed_lints(tcx);
     });
 
-    rustc_hir_analysis::check_crate(tcx);
+    let _prof_timer = tcx.sess.timer("type_check_crate_interfaces");
+    rustc_hir_analysis::check_crate_interfaces(tcx);
+}
+
+/// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
+/// This function never fails.
+fn run_required_analyses(tcx: TyCtxt<'_>) {
+    let sess = tcx.sess;
+    tcx.ensure_ok().analysis_interfaces(());
+    sess.time("type_check_crate_bodies", || rustc_hir_analysis::check_crate_bodies(tcx));
     // Freeze definitions as we don't add new ones at this point.
     // We need to wait until now since we synthesize a by-move body
     // for all coroutine-closures.
