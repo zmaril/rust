@@ -1186,6 +1186,14 @@ fn should_encode_mir(
     }
 }
 
+/// The reachable set, as `should_encode_mir` reads it: only with code
+/// generation. Without, it's empty: computing it walks the bodies of inline
+/// and generic functions, and at `opt-level` 1 or more, optimizes them.
+fn reachable_set_for_mir(tcx: TyCtxt<'_>) -> &LocalDefIdSet {
+    static EMPTY: std::sync::LazyLock<LocalDefIdSet> = std::sync::LazyLock::new(Default::default);
+    if tcx.sess.opts.output_types.should_codegen() { tcx.reachable_set(()) } else { &EMPTY }
+}
+
 fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: DefKind) -> bool {
     match def_kind {
         DefKind::Struct
@@ -1874,7 +1882,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         let tcx = self.tcx;
-        let reachable_set = tcx.reachable_set(());
+        let reachable_set = reachable_set_for_mir(tcx);
 
         let keys_and_jobs = tcx.mir_keys(()).iter().filter_map(|&def_id| {
             let (encode_const, encode_opt) = should_encode_mir(tcx, reachable_set, def_id);
